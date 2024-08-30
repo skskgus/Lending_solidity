@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {ERC20} from "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
+import {console} from "forge-std/console.sol";
 
 interface IPriceOracle {
     function getPrice(address token) external view returns (uint256);
@@ -60,21 +61,49 @@ contract DreamAcademyLending {
 
     function borrow(address asset, uint256 amount) external {
         require(asset == address(usdc), "Only USDC borrowing supported");
+
         updateBorrowIndex();
         accrueInterest(msg.sender);
-        uint256 collateralValue = users[msg.sender].supplied * oracle.getPrice(address(0)) / 1e18;
+
+        uint256 collateralValue = (users[msg.sender].supplied * oracle.getPrice(address(0)) / 1e18) * 80 / 100;
         uint256 borrowable = (collateralValue * 75) / 100;
-        require(users[msg.sender].borrowed + amount <= borrowable, "Insufficient collateral");
+
+        uint256 accruedInterest = users[msg.sender].borrowed * (borrowIndex - users[msg.sender].lastBorrowIndex) / 1e18;
+        require(users[msg.sender].borrowed + amount + accruedInterest <= borrowable, "Insufficient collateral after interest accrual");
+
         users[msg.sender].borrowed += amount;
         totalDebt += amount;
         users[msg.sender].lastBlockNumber = block.number;
+
         require(usdc.transfer(msg.sender, amount), "USDC transfer failed");
+    }
+
+    function liquidate(address borrower, address asset, uint256 amount) external {
+        require(asset == address(usdc), "Only USDC liquidation supported");
+
+        updateBorrowIndex();
+        accrueInterest(borrower);
+
+        uint256 debtValue = users[borrower].borrowed;
+        uint256 collateralValue = users[borrower].supplied * oracle.getPrice(address(0)) / 1e18;
+
+        require(debtValue > (collateralValue * 75) / 100, "Loan is not unhealthy");
+        require(amount <= debtValue * 25 / 100, "Liquidation exceeds allowed amount");
+
+        require(usdc.transferFrom(msg.sender, address(this), amount), "USDC transfer failed");
+        users[borrower].borrowed -= amount;
+        totalDebt -= amount;
+
+        uint256 seizedCollateral = amount * 1e18 / oracle.getPrice(address(0));
+        users[borrower].supplied -= seizedCollateral;
+        payable(msg.sender).transfer(seizedCollateral);
     }
 
     function repay(address asset, uint256 amount) external {
         require(asset == address(usdc), "Only USDC repayment supported");
         updateBorrowIndex();
         accrueInterest(msg.sender);
+    
         require(users[msg.sender].borrowed >= amount, "Exceeds borrowed amount");
         require(usdc.transferFrom(msg.sender, address(this), amount), "USDC transfer failed");
         users[msg.sender].borrowed -= amount;
@@ -95,22 +124,6 @@ contract DreamAcademyLending {
             require(usdcBalance >= amount, "Insufficient contract USDC balance");
             require(usdc.transfer(msg.sender, amount), "USDC transfer failed");
         }
-    }
-
-    function liquidate(address borrower, address asset, uint256 amount) external {
-        require(asset == address(usdc), "Only USDC liquidation supported");
-        updateBorrowIndex();
-        accrueInterest(borrower);
-        uint256 debtValue = users[borrower].borrowed;
-        uint256 collateralValue = users[borrower].supplied * oracle.getPrice(address(0)) / 1e18;
-        require(debtValue > (collateralValue * 75) / 100, "Loan is not unhealthy");
-        require(amount <= debtValue * 25 / 100, "Liquidation exceeds allowed amount");
-        require(usdc.transferFrom(msg.sender, address(this), amount), "USDC transfer failed");
-        users[borrower].borrowed -= amount;
-        totalDebt -= amount;
-        uint256 seizedCollateral = amount * 1e18 / oracle.getPrice(address(0));
-        users[borrower].supplied -= seizedCollateral;
-        payable(msg.sender).transfer(seizedCollateral);
     }
 
     function getAccruedSupplyAmount(address asset) external view returns (uint256) {
